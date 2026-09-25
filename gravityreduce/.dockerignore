@@ -1,0 +1,9 @@
+# 构建产物与本地杂物，不进入镜像
+/bin/
+/dist/
+*.test
+*.out
+.DS_Store
+# 保留 vendor/（离线构建需要），仅排除可能的编辑器/缓存目录
+.idea/
+.vscode/
