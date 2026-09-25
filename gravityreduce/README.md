@@ -134,13 +134,80 @@ Somigliana 闭合公式：
 
 响应 `points[]` 每项含 `h_m`、`free_air_correction_mgal`、`bouguer_slab_correction_mgal`、`bouguer_anomaly{mgal,m_s2}`。
 
-### 3.3 内置手工验算示例 `GET /api/v1/sample`
+### 3.3 测线/测网批量归算与质量诊断 `POST /api/v1/lines/reduce`
+
+一次收下**一条或多条测线**。每个测点除原来的 `gobs/h/phi/rho` 外，还要带测区
+平面直角坐标 `easting_m`（东向，米）、`northing_m`（北向，米），并建议带沿线
+里程 `station_m`（桩号，米）。服务对每个点**逐点复用 §1 的单点归算**拿到布格异常，
+再在测线层做三类质控：
+
+1. **沿测线水平梯度诊断**：先按里程理顺测点先后（不假定输入有序），逐段算
+   `梯度 =（后点布格异常 − 前点布格异常）/ 水平距离`（mGal/km），超过
+   `gradient_threshold_mgal_per_km` 的段标 `suspicious`，给出两端点、梯度与超出量。
+   同位置重复布点（水平距离为 0）不报 Inf、不崩溃，而以 `kind:"coincident"`
+   作为明确数据异常报出。
+2. **测线两两交点差**：所有测线 i<j 两两配对，由两条线的平面折线段求交，
+   判断交点是否落在两侧**实测段范围内**，再在每条线上按相邻测点布格异常线性插值，
+   给出交点坐标、两侧插值（含所用测点段与插值参数 `parameter_t`）、交点差
+   `difference_mgal = A−B` 及是否超 `intersection_tolerance_mgal`。平行、共线、
+   延长线相交但越界、任一线降级等情形一律 `status:"no_intersection"` 并带原因码，
+   **绝不硬凑交点差**。
+3. **线内统计画像**：点数、均值、样本标准差（n−1）、最大/最小值及对应测点，
+   全部由该线各点**真实归算结果**算出。
+
+降级不是拒绝：单点测线、里程缺失/重复的线仍返回各点真实归算与统计，但
+`status:"degraded"` 并带 `degrade_reasons`，梯度诊断 `status:"skipped"`，
+涉及它的交点配对报 `line_degraded`。
+
+平面坐标与里程**只用于测线几何与诊断，不参与物理归算**——整体平移一条线
+（东向/北向加常量）各点布格异常与线内梯度诊断完全不变，已由测试锁定。
+
+> 本接口只做重力测线的归算与质控：不做地图瓦片渲染、不做测线可视化绘图、
+> 不涉及派工调度或人员轨迹。
+
+请求：
+
+```json
+{
+  "gradient_threshold_mgal_per_km": 30.0,
+  "intersection_tolerance_mgal": 0.5,
+  "lines": [
+    { "id": "L1", "points": [
+      { "id": "L1-0", "gobs": 9.8060, "h": 100, "phi": 45, "rho": 2.67,
+        "easting_m": 0, "northing_m": 0, "station_m": 0 },
+      { "id": "L1-1", "gobs": 9.8058, "h": 100, "phi": 45, "rho": 2.67,
+        "easting_m": 100, "northing_m": 0, "station_m": 100 }
+    ]},
+    { "id": "L2", "points": [
+      { "id": "L2-0", "gobs": 9.8060, "h": 100, "phi": 45, "rho": 2.67,
+        "easting_m": 50, "northing_m": -50, "station_m": 0 },
+      { "id": "L2-1", "gobs": 9.8059, "h": 100, "phi": 45, "rho": 2.67,
+        "easting_m": 50, "northing_m": 50, "station_m": 100 }
+    ]}
+  ]
+}
+```
+
+- `gradient_threshold_mgal_per_km` 必填，**正数**（mGal/km）。
+- `intersection_tolerance_mgal` 必填，**非负**（mGal）。
+- 线 `id`、点 `id` 必填且各自唯一；两个平面坐标必填；`station_m` 选填，
+  整条线要么都给（定序），要么都不给（里程无法定序，该线诊断降级）。
+
+响应 `lines[]` 含 `points`（已按里程排序的逐点归算）、`gradient.segments[]`、
+`statistics`；`pairs[]` 每对含上述交点信息或无交点原因。
+无交点原因码：`line_degraded` / `zero_length_line` / `parallel` /
+`collinear` / `intersection_out_of_range`。
+
+输入问题沿用既有错误风格（400 非法 JSON/未知字段；422 物理不合理或缺字段，
+字段路径定位到具体线/点，如 `lines[0].points[1].easting_m`）。
+
+### 3.4 内置手工验算示例 `GET /api/v1/sample`
 
 返回中纬度、200 m 测点（见下节），便于人工核对。
 
-### 3.4 健康检查 `GET /healthz` → `200 {"status":"ok",...}`
+### 3.5 健康检查 `GET /healthz` → `200 {"status":"ok",...}`
 
-### 3.5 错误格式
+### 3.6 错误格式
 
 非法/缺失输入**明确拒绝**，不返回看似正常的结果：
 
@@ -188,21 +255,55 @@ gobs   = 9.80600000 m/s² = 980600.000 mGal
 ## 6. 代码结构（按职责拆模块）
 
 ```
-cmd/server/main.go            启动、端口、Gin 模式
-internal/units/units.go       mGal ↔ m/s² 单位换算（唯一出入口）
+cmd/server/main.go              启动、端口、Gin 模式
+internal/units/units.go         mGal ↔ m/s² 单位换算（唯一出入口）
 internal/gravity/
-  normal_gravity.go           国际正常重力公式（仅此处用纬度）
-  corrections.go              自由空气改正、布格板改正、地形(=0)
-  reduction.go                合成布格异常（符号钉死）+ 高程扫描
-internal/validate/validate.go 物理合理性与输入完备性校验
-internal/api/                 HTTP：router / handlers / dto
-internal/sample/sample.go     内置手工验算示例
-vendor/                       固化依赖（离线构建）
+  normal_gravity.go             国际正常重力公式（仅此处用纬度）
+  corrections.go                自由空气改正、布格板改正、地形(=0)
+  reduction.go                  合成布格异常（符号钉死）+ 高程扫描
+internal/validate/validate.go   物理合理性与输入完备性校验
+internal/survey/                测线/测网批量归算与质量诊断（独立职责层）
+  survey.go                     领域类型：测线、点、梯度段、配对、统计、原因码
+  validate.go                   批量请求结构/物理校验（逐点复用 validate.Point）
+  line.go                       测点组织、按里程排序、逐点复用 gravity.Reduce、统计
+  gradient.go                   沿测线水平梯度诊断（含零距离退化）
+  intersect.go                  平面折线段求交 + 交点处线性插值
+  process.go                    批量编排：逐线处理、测线两两配对
+internal/api/                   HTTP：router / handlers / dto
+  lines_dto.go / lines_handlers.go / lines_views.go   测线批量接口
+internal/sample/sample.go       内置手工验算示例
+vendor/                         固化依赖（离线构建）
 ```
+
+批量层**复用而非重写**单点物理链条与单位换算：它只调用 `gravity.Reduce` /
+`gravity.NormalGravity` / `gravity.FreeAirCorrection` / `gravity.BouguerSlabCorrection`
+与 `units` 包，原单点接口、高程扫描、内置示例、错误返回风格保持不变。
 
 ---
 
-## 7. 运行、测试、构建
+## 7. 测线层被测试锁定的关键关系
+
+位于 `internal/survey/survey_test.go` 与 `internal/api/lines_api_test.go`：
+
+1. **平面平移不变**：整体沿东向/北向平移，各点布格异常、点序、梯度/可疑段/
+   零距离段与水平距离全部不变。
+2. **居中插点不告警**：在直线段中部插入里程居中、异常与线性趋势一致的点，
+   不新增可疑段（各小段梯度与原段一致）。
+3. **抬高触发两侧告警**：某点观测量不变、高程明显调离邻点，其左右两段都被标可疑，
+   梯度数值用独立公式 `(0.3086−0.04193ρ)·Δh/距离` 交叉验证，且两侧符号相反。
+4. **平行线无交点**：无论测点如何摆，返回 `no_intersection/parallel`，不产生交点差。
+   共线（`collinear`）、延长线交点越界（`intersection_out_of_range`）同样拒绝凑数。
+5. **等值交点差为零**：正交两线交点在测点段正中（`parameter_t=0.5`），两侧插值相等，
+   交点差恰为 0；交点恰在已测点上（t=0/1）时同样成立。
+6. **系统偏移交点差非零**：一条线整体抬高常量高程，交点差按
+   `A−B = −(0.3086−0.04193ρ)·Δh` 呈可预期的非零系统偏移并标记超容差。
+7. **退化输入**：同位置重复布点报 `coincident`（梯度为 0 而非 Inf/NaN）；
+   单点测线归算/统计照常但梯度跳过、配对降级；里程缺失或重复定序降级；
+   请求级缺坐标、缺阈值、空线、重复 ID、NaN/Inf 等带字段原因拒绝。
+
+---
+
+## 8. 运行、测试、构建
 
 ### 本地（需 Go 1.22）
 

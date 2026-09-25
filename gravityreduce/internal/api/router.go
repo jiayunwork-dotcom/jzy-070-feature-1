@@ -14,9 +14,10 @@ func NewRouter() *gin.Engine {
 
 	v1 := r.Group("/api/v1")
 	{
-		v1.POST("/reduce", Reduce) // 单点归算
-		v1.POST("/scan", Scan)     // 高程扫描
-		v1.GET("/sample", Sample)  // 内置手工验算示例
+		v1.POST("/reduce", Reduce)            // 单点归算
+		v1.POST("/scan", Scan)                // 高程扫描
+		v1.POST("/lines/reduce", ReduceLines) // 测线/测网批量归算与质量诊断
+		v1.GET("/sample", Sample)             // 内置手工验算示例
 	}
 
 	return r
